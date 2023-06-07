@@ -648,6 +648,7 @@ impl Kv for MockEtcd {
     }
 
     fn txn(&mut self, _ctx: RpcContext, req: TxnRequest, sink: UnarySink<TxnResponse>) {
+        log::debug!("Receive txn request");
         let inner_clone = Arc::<Mutex<MockEtcdInner>>::clone(&self.inner);
 
         smol::spawn(async move {
