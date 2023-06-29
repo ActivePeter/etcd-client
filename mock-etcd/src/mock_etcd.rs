@@ -31,9 +31,14 @@ use std::time::Duration;
 use utilities::{Cast, OverflowArithmetic};
 
 /// Help function to send success `gRPC` response
-async fn success<R: Send>(response: R, sink: UnarySink<R>) {
+async fn success<R: Send>(response: R, sink: UnarySink<R>, error_context: &str) {
     sink.success(response)
-        .map_err(|e| error!("failed to send response, the error is: {:?}", e))
+        .map_err(|e| {
+            error!(
+                "failed to send response, the error is: {:?}, error_context:{}",
+                e, error_context
+            )
+        })
         .map(|_| ())
         .await;
 }
@@ -45,10 +50,15 @@ fn fail<R>(ctx: &RpcContext, sink: UnarySink<R>, rsc: RpcStatusCode, details: St
         RpcStatusCode::OK,
         "the input RpcStatusCode should not be OK"
     );
-    let rs = RpcStatus::with_message(rsc, details);
+    let rs = RpcStatus::with_message(rsc, details.clone());
     let f = sink
         .fail(rs)
-        .map_err(|e| error!("failed to send response, the error is: {:?}", e))
+        .map_err(move |e| {
+            error!(
+                "failed to send response, the error is: {:?}, details:{}",
+                e, details
+            )
+        })
         .map(|_| ());
     ctx.spawn(f);
 }
@@ -699,7 +709,7 @@ impl Kv for MockEtcd {
             let mut inner = inner_clone.lock().await;
             log::debug!("inner lock range");
 
-            success(Self::range_inner(&mut inner, &req), sink).await;
+            success(Self::range_inner(&mut inner, &req), sink, "range_success").await;
             log::debug!("inner unlocked range");
         };
 
@@ -718,7 +728,7 @@ impl Kv for MockEtcd {
             let mut inner = inner_clone.lock().await;
             log::debug!("inner lock put");
 
-            success(Self::put_inner(&mut inner, &req).await, sink).await;
+            success(Self::put_inner(&mut inner, &req).await, sink, "put_success").await;
             log::debug!("inner unlocked put");
         };
         smol::spawn(task).detach();
@@ -751,7 +761,7 @@ impl Kv for MockEtcd {
 
             // sometimes it can't send the response, so we use a timer to make sure the response is sent
             Timer::after(Duration::from_millis(1000));
-            success(response, sink).await;
+            success(response, sink, "delete success").await;
 
             log::debug!("inner unlock delete_range");
         };
@@ -767,7 +777,7 @@ impl Kv for MockEtcd {
 
             let response = Self::txn_inner(&mut inner, &req).await;
 
-            success(response, sink).await;
+            success(response, sink, "txn success").await;
             log::debug!("inner unlock txn");
         })
         .detach();
@@ -797,19 +807,26 @@ impl Lock for MockEtcd {
 
                 if inner.lock_map.contains(req.get_name()) {
                     drop(inner);
-                    Timer::after(Duration::from_secs(1)).await;
-                    log::debug!("inner unlock `lock`");
+                    log::debug!("inner unlock `lock`,lock is hold by other, wait 300ms for unlock or lease timeout");
+                    Timer::after(Duration::from_millis(300)).await;
                 } else {
-                    inner.lock_map.insert(req.get_name().to_vec());
-                    inner.set_lock_key_2_lease(req.get_lease(), req.get_name().to_vec());
                     let revision = inner.revision.load(Ordering::Relaxed);
-                    drop(inner);
-                    log::debug!("inner unlock `lock`");
+
+                    log::debug!("inner unlock `lock`, lock success");
                     let mut response = LockResponse::new();
                     response.set_key(req.get_name().to_vec());
                     let header = response.mut_header();
                     header.set_revision(revision);
-                    success(response, sink).await;
+                    match sink.success(response).await {
+                        Ok(_) => {
+                            inner.lock_map.insert(req.get_name().to_vec());
+                            inner.set_lock_key_2_lease(req.get_lease(), req.get_name().to_vec());
+                        }
+                        Err(e) => {
+                            warn!("Fail to send lock response, the error is: {}", e);
+                        }
+                    }
+                    drop(inner);
                     break;
                 }
             }
@@ -835,7 +852,7 @@ impl Lock for MockEtcd {
             let mut response = UnlockResponse::new();
             let header = response.mut_header();
             header.set_revision(revision);
-            success(response, sink).await;
+            success(response, sink, "unlock success").await;
         };
 
         smol::spawn(task).detach();
@@ -915,7 +932,7 @@ impl Lease for MockEtcd {
             .detach();
             let mut response = LeaseGrantResponse::new();
             response.set_ID(lease_id);
-            success(response, sink).await;
+            success(response, sink, "lease grant success").await;
         };
 
         smol::spawn(task).detach();
